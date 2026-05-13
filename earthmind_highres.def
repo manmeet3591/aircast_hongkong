@@ -1,0 +1,15 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.12-py3
+%post
+    echo "Installing core Python packages..."
+    pip install --upgrade pip
+    
+    # These are vital for your data handling and AI training
+    pip install xarray[complete] wandb timm jupyter gcsfs rioxarray zarr "numcodecs==0.12.1"
+    
+    # diffusers is installed here along with transformers
+    pip install diffusers["torch"] transformers
+    
+    # Final fix for the s3fs dependency
+    pip install s3fs dask pandas matplotlib
+

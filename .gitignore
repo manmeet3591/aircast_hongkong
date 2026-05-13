@@ -1,0 +1,20 @@
+# PyTorch / Machine Learning
+*.pt
+*.pth
+*.sif
+*.zarr
+*.nc
+__pycache__/
+*.log
+
+# Data
+inference_outputs/
+runs/
+logs/
+
+# System
+.DS_Store
+.venv
+venv/
+env/
+.env
