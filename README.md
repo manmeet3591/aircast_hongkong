@@ -74,8 +74,3 @@ python3 inference_final_version.py \
     --out_name aircast_hk_inference \
     --overwrite
 ```
-
-## Authors
-- Somnath Luitel
-- Manmeet Singh
-AI Research Lab, Earth, Environment and Atmospheric Sciences, WKU.
