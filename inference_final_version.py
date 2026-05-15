@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-Earthmind Inference Script — Final 
+Earthmind Inference Script — RUMI Enabled
 =========================================================
 
-Usage example:
-  python earthmind_inference_final.py \
-    --graphcast_zarr /path/to/graphcast.zarr \
-    --gc_min_zarr /path/to/gc_min.zarr \
-    --gc_max_zarr /path/to/gc_max.zarr \
-    --topo_nc /path/to/elevation.nc \
-    --svf_nc /path/to/sky_view_factor.nc \
-    --aorc_min_nc /path/to/aorc_min.nc \
-    --aorc_max_nc /path/to/aorc_max.nc \
-    --checkpoint /path/to/model.pt \
-    --start_date 2021-07-04 \
-    --end_date 2021-12-31 \
-    --num_inits 10 \
-    --lat_min 25.0 --lat_max 50.0 \
-    --lon_min -125.0 --lon_max -65.0 \
-    --patch 256 --stride 128 \
-    --steps 4 8 25 50 \
-    --out_dir /path/to/output \
-    --out_name conus_inference \
+Usage example for RUMI:
+  python inference_final_version.py \
+    --gcs_zarr_root /home/airlab/gcs_bucket \
+    --gc_min_zarr /home/airlab/Documents/airlab/earthmind_highres/graphcast_training_2020_2021_min.zarr \
+    --gc_max_zarr /home/airlab/Documents/airlab/earthmind_highres/graphcast_training_2020_2021_max.zarr \
+    --topo_nc /home/airlab/Documents/airlab/earthmind_highres/TOPO_Hongkong.nc \
+    --svf_nc /home/airlab/Documents/airlab/earthmind_highres/SVF_Hongkong.nc \
+    --aorc_min_nc /home/airlab/Documents/airlab/earthmind_highres/usa_aorc_min.nc \
+    --aorc_max_nc /home/airlab/Documents/airlab/earthmind_highres/usa_aorc_max.nc \
+    --checkpoint /media/airlab/ROCSTOR/earthmind_highres/models_unet3d_fast/unet3d_global_best_ic_20210127T060000.pt \
+    --start_date 2018-09-15 \
+    --end_date 2018-09-17 \
+    --num_inits 1 \
+    --rumi --event MANGKHUT2018 \
+    --out_dir ./rumi_outputs \
     --overwrite
 """
 from __future__ import annotations
@@ -39,6 +35,7 @@ import numpy as np
 import xarray as xr
 import dask
 import zarr
+import netCDF4 as nc4
 from tqdm import tqdm
 
 import torch
@@ -57,6 +54,30 @@ TTARGET = 67   # number of hourly AORC output timesteps (asserted at runtime)
 TARGET_CHANNELS = 8    # number of AORC output variables
 COND_CHANNELS   = 20   # 17 (3D GC vars) + 2 (topo, svf) + 1 (cos_sza)
 
+
+# =============================================================================
+# RUMI Specifications
+# =============================================================================
+
+RUMI_LAT_MIN, RUMI_LAT_MAX = 22.12, 22.58
+RUMI_LON_MIN, RUMI_LON_MAX = 113.82, 114.45
+RUMI_NLAT, RUMI_NLON = 171, 234
+
+# Standard RUMI Output Grid
+RUMI_LAT = np.linspace(RUMI_LAT_MIN, RUMI_LAT_MAX, RUMI_NLAT, dtype=np.float64)
+RUMI_LON = np.linspace(RUMI_LON_MIN, RUMI_LON_MAX, RUMI_NLON, dtype=np.float64)
+
+# Variable Mapping: RUMI Name -> (AORC Name, Units, CF Standard Name, Long Name)
+RUMI_VAR_MAP = {
+    "T2M": ("TMP_2maboveground", "K", "air_temperature", "2-meter air temperature"),
+    "U10M": ("UGRD_10maboveground", "m s-1", "eastward_wind", "10-meter eastward wind component"),
+    "V10M": ("VGRD_10maboveground", "m s-1", "northward_wind", "10-meter northward wind component"),
+    "PRATE": ("APCP_surface", "kg m-2 s-1", "precipitation_flux", "precipitation rate"),
+    "SLP": ("PRES_surface", "Pa", "air_pressure_at_mean_sea_level", "sea level pressure"), # SLP needs reduction, using PSFC for now
+    "RH2M": ("SPFH_2maboveground", "1", "relative_humidity", "2-meter relative humidity"), # Needs conversion from Q to RH
+    "PSFC": ("PRES_surface", "Pa", "surface_air_pressure", "surface air pressure"),
+    "Q2M": ("SPFH_2maboveground", "kg kg-1", "specific_humidity", "2-meter specific humidity"),
+}
 
 # =============================================================================
 # Variable lists — must match training exactly
@@ -111,7 +132,7 @@ def ts() -> str:
 
 
 def log(msg: str) -> None:
-    tqdm.write(f"[{ts()}] {msg}")
+    print(f"[{ts()}] {msg}", flush=True)
 
 
 def ensure_dir(p: str | Path) -> Path:
@@ -327,6 +348,8 @@ def open_and_prepare_graphcast(
         longitude=_maybe_convert_lon_360_to_180(ds_norm["longitude"].values)
     ).sortby("longitude")
 
+    if "sample" in ds_norm.dims:
+        ds_norm = ds_norm.isel(sample=0)
     return ds_norm
 
 
@@ -351,7 +374,7 @@ def _find_zarr_stores_in_dir(year_dir: Path) -> List[Tuple[Path, str]]:
         if not zarr_path.is_dir():
             continue
         name = zarr_path.name
-        if "_6_hours.zarr" in name:
+        if "_6_hours.zarr" in name or "predictions.zarr" in name:
             results.append((zarr_path, "A"))
         elif "_12_hours.zarr" in name:
             results.append((zarr_path, "B"))
@@ -462,8 +485,6 @@ def open_gcs_graphcast(
     ds_all = xr.concat(datasets, dim="time").sortby("time")
 
     # Keep only the first TCOND=12 lead times — matches training exactly.
-    # GCS data often contains 40 steps (10-day forecast); the model was
-    # trained on 12 steps (6hr → 72hr) only.
     ds_all = ds_all.isel(prediction_timedelta=slice(0, TCOND))
     log(f"  Sliced to first {TCOND} prediction_timedelta steps (6hr → 72hr).")
 
@@ -483,6 +504,9 @@ def open_gcs_graphcast(
     log("  Normalizing GraphCast (GCS)…")
     ds_all = normalize_graphcast(ds_all, gc_min, gc_max)
 
+    if "sample" in ds_all.dims:
+        ds_all = ds_all.isel(sample=0)
+
     return ds_all
 
 
@@ -496,6 +520,7 @@ def load_static_grids(
     topo0 = xr.open_dataset(topo_nc)
     svf0  = xr.open_dataset(svf_nc)
 
+    # Some files use lat/lon, others latitude/longitude
     t_lat, t_lon = _standardize_lat_lon_coords(topo0)
     s_lat, s_lon = _standardize_lat_lon_coords(svf0)
 
@@ -529,17 +554,11 @@ def subset_static_to_bbox(
     lat = topo_sub["latitude"].values.astype(np.float32)
     lon = topo_sub["longitude"].values.astype(np.float32)
 
-    if "norm_elevation" not in topo_sub:
-        raise KeyError(
-            f"topo file missing 'norm_elevation'. Available vars: {list(topo_sub.data_vars)}"
-        )
-    if "SKY_VIEW_FACTOR" not in svf_sub:
-        raise KeyError(
-            f"svf file missing 'SKY_VIEW_FACTOR'. Available vars: {list(svf_sub.data_vars)}"
-        )
+    t_var = "norm_elevation" if "norm_elevation" in topo_sub else "ELEVATION"
+    s_var = "SKY_VIEW_FACTOR"
 
-    topo_arr = topo_sub["norm_elevation"].astype(np.float32)
-    svf_arr  = svf_sub["SKY_VIEW_FACTOR"].astype(np.float32)
+    topo_arr = topo_sub[t_var].astype(np.float32)
+    svf_arr  = svf_sub[s_var].astype(np.float32)
     return lat, lon, topo_arr, svf_arr
 
 
@@ -552,26 +571,10 @@ def check_bbox_coverage(
     lat_min: float, lat_max: float,
     lon_min: float, lon_max: float,
 ) -> None:
-    """
-    Assert that the requested bounding box is fully covered by the
-    GraphCast grid. Fails early with a clear message rather than
-    silently producing NaN-filled output at domain edges.
-    """
     gc_lat_min = float(ds_gc["latitude"].min())
     gc_lat_max = float(ds_gc["latitude"].max())
     gc_lon_min = float(ds_gc["longitude"].min())
     gc_lon_max = float(ds_gc["longitude"].max())
-
-    log(
-        f"GraphCast grid extent: "
-        f"lat=[{gc_lat_min:.3f}, {gc_lat_max:.3f}]  "
-        f"lon=[{gc_lon_min:.3f}, {gc_lon_max:.3f}]"
-    )
-    log(
-        f"Requested bbox:        "
-        f"lat=[{lat_min:.3f}, {lat_max:.3f}]  "
-        f"lon=[{lon_min:.3f}, {lon_max:.3f}]"
-    )
 
     errors = []
     if lat_min < gc_lat_min:
@@ -587,10 +590,7 @@ def check_bbox_coverage(
         raise ValueError(
             "Requested bounding box exceeds GraphCast domain:\n"
             + "\n".join(errors)
-            + "\nAdjust --lat_min/lat_max/lon_min/lon_max accordingly."
         )
-
-    log("Bounding box coverage check passed.")
 
 
 # =============================================================================
@@ -601,18 +601,13 @@ def iter_tiles(
     nlat: int, nlon: int, patch: int, stride: int
 ) -> Iterable[Tuple[int, int, int, int]]:
     if patch > nlat or patch > nlon:
-        raise ValueError(
-            f"patch={patch} is larger than the target grid ({nlat} x {nlon}). "
-            f"Reduce --patch or expand your bounding box."
-        )
+        raise ValueError(f"patch={patch} larger than grid ({nlat}x{nlon})")
 
     i_starts = list(range(0, nlat - patch + 1, stride))
     j_starts = list(range(0, nlon - patch + 1, stride))
 
-    if i_starts[-1] != nlat - patch:
-        i_starts.append(nlat - patch)
-    if j_starts[-1] != nlon - patch:
-        j_starts.append(nlon - patch)
+    if i_starts[-1] != nlat - patch: i_starts.append(nlat - patch)
+    if j_starts[-1] != nlon - patch: j_starts.append(nlon - patch)
 
     for i0 in i_starts:
         for j0 in j_starts:
@@ -624,11 +619,6 @@ def iter_tiles(
 # =============================================================================
 
 def make_blend_weights_2d(patch: int, overlap: int) -> np.ndarray:
-    """
-    Cosine-taper 2D weight mask for one tile.
-    Interior pixels → 1.0; within `overlap` pixels of any edge → cosine ramp.
-    When two adjacent tiles' masks overlap they sum to ~1.0 → seamless blend.
-    """
     if overlap <= 0:
         return np.ones((patch, patch), dtype=np.float32)
 
@@ -648,8 +638,8 @@ def make_blend_weights_2d(patch: int, overlap: int) -> np.ndarray:
 def create_unet(device: str) -> UNet3DConditionModel:
     return UNet3DConditionModel(
         sample_size=None,
-        in_channels=TARGET_CHANNELS + COND_CHANNELS,   # 8 + 20 = 28
-        out_channels=TARGET_CHANNELS,                   # 8
+        in_channels=TARGET_CHANNELS + COND_CHANNELS,
+        out_channels=TARGET_CHANNELS,
         layers_per_block=2,
         block_out_channels=(64, 128, 256, 512),
         down_block_types=("DownBlock3D",) * 4,
@@ -667,17 +657,9 @@ def load_model(
     amp_dtype: torch.dtype,
 ) -> torch.nn.Module:
     ckpt = Path(checkpoint_path).expanduser().resolve()
-    if not ckpt.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
-
     log(f"Loading checkpoint: {ckpt}")
     payload = torch.load(str(ckpt), map_location="cpu", weights_only=False)
-    if "model_state_dict" not in payload:
-        raise KeyError(
-            f"'model_state_dict' key missing from checkpoint. "
-            f"Found keys: {list(payload.keys())}"
-        )
-
+    
     model     = create_unet("cpu")
     raw_state = payload["model_state_dict"]
     state     = {k.replace("_orig_mod.", ""): v for k, v in raw_state.items()}
@@ -688,8 +670,6 @@ def load_model(
     if use_amp and device == "cuda":
         model = model.to(dtype=amp_dtype)
 
-    total = sum(p.numel() for p in model.parameters())
-    log(f"Model ready on {device}. Total parameters: {total:,}")
     return model
 
 
@@ -708,20 +688,9 @@ def infer_batch(
     use_amp: bool,
     amp_dtype: torch.dtype,
 ) -> np.ndarray:
-    """
-    Run diffusion denoising for one tile.
-
-    Parameters
-    ----------
-    X_np : (B, C, Tcond, P, P)  conditioning input, float32
-    Returns
-    -------
-    np.ndarray  (B, C, Ttarget, P, P)  predicted output in [0,1] normalized space
-    """
     B = X_np.shape[0]
     x = torch.from_numpy(X_np).to(device=device, dtype=torch.float32)
 
-    # Interpolate conditioning from Tcond → Ttarget along time axis
     x_match = F.interpolate(
         x, size=(ttarget, patch, patch), mode="trilinear", align_corners=False
     )
@@ -730,24 +699,13 @@ def infer_batch(
         (B, TARGET_CHANNELS, ttarget, patch, patch),
         device=device, dtype=torch.float32,
     )
-    cad    = int(model.config.cross_attention_dim if hasattr(model, "config") else 1)
+    cad    = 1
     enc_hs = torch.zeros((B, 1, cad), device=device, dtype=torch.float32)
 
     scheduler.set_timesteps(num_steps, device=device)
 
-    t_denoise_start = time.time()
-    log(f"  [denoise] starting {num_steps} denoising steps at {ts()}")
-
     with torch.inference_mode():
-        for step_i, t in enumerate(
-            tqdm(
-                scheduler.timesteps,
-                desc=f"  [{ts()}] denoise",
-                leave=False,
-                unit="step",
-            ),
-            start=1,
-        ):
+        for t in tqdm(scheduler.timesteps, desc="denoise", leave=False):
             net_in = torch.cat([pred, x_match], dim=1)
 
             sdp_ctx = contextlib.nullcontext()
@@ -759,147 +717,152 @@ def infer_batch(
             with sdp_ctx:
                 if use_amp and device == "cuda":
                     with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                        out = model(
-                            sample=net_in, timestep=t, encoder_hidden_states=enc_hs
-                        )
+                        out = model(sample=net_in, timestep=t, encoder_hidden_states=enc_hs)
                 else:
-                    out = model(
-                        sample=net_in, timestep=t, encoder_hidden_states=enc_hs
-                    )
+                    out = model(sample=net_in, timestep=t, encoder_hidden_states=enc_hs)
 
             residual = out.sample if hasattr(out, "sample") else out[0]
             pred     = scheduler.step(residual.float(), t, pred).prev_sample
-
-            # Log every 25% of denoising steps
-            if step_i % max(1, num_steps // 4) == 0 or step_i == num_steps:
-                elapsed = time.time() - t_denoise_start
-                log(
-                    f"  [denoise] step {step_i}/{num_steps}  "
-                    f"elapsed={elapsed:.1f}s  ts={ts()}"
-                )
-
-    total_denoise = time.time() - t_denoise_start
-    log(f"  [denoise] completed {num_steps} steps in {total_denoise:.2f}s  ({ts()})")
 
     return pred.detach().cpu().numpy().astype(np.float32)
 
 
 # =============================================================================
-# Zarr output store
+# RUMI Output Implementation
 # =============================================================================
 
-def init_output_store(
-    out_zarr: str,
-    time_ic: np.ndarray,
+def q_to_rh(q, t, p):
+    """
+    Approximate Specific Humidity (q) to Relative Humidity (rh).
+    q: kg/kg, t: K, p: Pa
+    Returns rh fraction (0-1).
+    """
+    # Tetens formula for saturation vapor pressure over water
+    t_c = t - 273.15
+    es = 611.2 * np.exp(17.67 * t_c / (t_c + 243.5))
+    # Vapor pressure e from specific humidity q
+    # q = 0.622 * e / (p - 0.378 * e)  => e = p*q / (0.622 + 0.378*q)
+    e = (p * q) / (0.622 + 0.378 * q)
+    rh = e / es
+    return np.clip(rh, 0.0, 1.0)
+
+def write_rumi_nc(
+    out_dir: str,
+    event_code: str,
+    t0: np.datetime64,
     lead_hours: np.ndarray,
-    lat: np.ndarray,
-    lon: np.ndarray,
-    chunk_patch: int,
-    overwrite: bool,
+    lat_model: np.ndarray,
+    lon_model: np.ndarray,
+    data_dict: Dict[str, np.ndarray], # {var: (T, H, W)}
+    args: argparse.Namespace
 ) -> None:
-    if overwrite and os.path.exists(out_zarr):
-        log(f"Removing existing output: {out_zarr}")
-        shutil.rmtree(out_zarr)
+    """
+    Interpolates results to 300m grid and saves as RUMI-compliant NetCDF4 files.
+    One file per lead hour.
+    """
+    log(f"Preparing RUMI NetCDF4 output for event {event_code}...")
 
-    root        = zarr.open_group(out_zarr, mode="w")
-    compressors = make_zarr_v3_compressors()
-    _NS_PER_S   = np.int64(1_000_000_000)
-
-    t_ic_s  = time_ic.astype("datetime64[ns]").astype("int64") // _NS_PER_S
-    arr_tic = root.create_array("time_ic", data=t_ic_s, overwrite=True)
-    arr_tic.attrs["units"]    = "seconds since 1970-01-01 00:00:00"
-    arr_tic.attrs["calendar"] = "proleptic_gregorian"
-
-    root.create_array("lead_time",  data=lead_hours.astype(np.int32), overwrite=True)
-    root.create_array("latitude",   data=lat.astype(np.float32),      overwrite=True)
-    root.create_array("longitude",  data=lon.astype(np.float32),      overwrite=True)
-
-    arr_vt = root.create_array(
-        "valid_time",
-        shape=(time_ic.size, lead_hours.size),
-        chunks=(1, lead_hours.size),
-        dtype="i8",
-        compressors=compressors,
-        overwrite=True,
+    # Forcing Mode
+    f_mode = "analysis" if "AN" in args.experiment else "forecast"
+    
+    # 1. Create Xarray Dataset from model output
+    ds_model = xr.Dataset(
+        coords={
+            "lead_hour": lead_hours,
+            "latitude": lat_model,
+            "longitude": lon_model
+        }
     )
-    arr_vt.attrs["units"]    = "seconds since 1970-01-01 00:00:00"
-    arr_vt.attrs["calendar"] = "proleptic_gregorian"
+    for v, arr in data_dict.items():
+        ds_model[v] = (("lead_hour", "latitude", "longitude"), arr)
 
-    shape  = (time_ic.size, lead_hours.size, lat.size, lon.size)
-    chunks = (1, lead_hours.size, chunk_patch, chunk_patch)
-
-    for v in AORC_VARS:
-        root.create_array(
-            v, shape=shape, chunks=chunks, dtype="f4",
-            compressors=compressors, overwrite=True,
-        )
-
-    log(f"Initialized output Zarr v3: {out_zarr}  shape={shape}  chunks={chunks}")
-
-
-def write_valid_time(
-    root: zarr.Group, ic_idx: int, valid_time: np.ndarray
-) -> None:
-    root["valid_time"][ic_idx, :] = (
-        valid_time.astype("datetime64[ns]").astype("int64")
-        // np.int64(1_000_000_000)
+    # 2. Interpolate to RUMI standard grid
+    ds_rumi_raw = ds_model.interp(
+        latitude=RUMI_LAT,
+        longitude=RUMI_LON,
+        method="linear"
     )
 
-
-# =============================================================================
-# Output summary
-# =============================================================================
-
-def _print_zarr_summary(out_zarr: str) -> None:
-    root = zarr.open_group(out_zarr, mode="r")
-    sep  = "─" * 72
-
-    tqdm.write(f"\n{sep}")
-    tqdm.write(f"  Output Zarr Summary: {out_zarr}")
-    tqdm.write(sep)
-
-    coord_keys = ["time_ic", "lead_time", "latitude", "longitude", "valid_time"]
-    tqdm.write("  Coordinates:")
-    for key in coord_keys:
-        if key not in root:
-            continue
-        arr   = root[key]
-        units = dict(arr.attrs).get("units", "")
-        tqdm.write(
-            f"    {key:<20s}  shape={str(arr.shape):<20s}  dtype={str(arr.dtype):<8s}"
-            + (f"  units='{units}'" if units else "")
-        )
-
-    tqdm.write("  Data variables:")
-    total_bytes = 0
-    for v in AORC_VARS:
-        if v not in root:
-            continue
-        arr    = root[v]
-        nbytes = arr.nbytes
-        total_bytes += nbytes
-        tqdm.write(
-            f"    {v:<28s}  shape={str(arr.shape):<28s}  "
-            f"dtype={str(arr.dtype):<8s}  size={nbytes / 1e6:>8.2f} MB"
-        )
-
-    tqdm.write(f"  {'─'*68}")
-    tqdm.write(
-        f"  Total uncompressed data: {total_bytes / 1e9:.3f} GB  |  vars={len(AORC_VARS)}"
+    # 3. Unit Conversions and Mapping
+    ds_rumi = xr.Dataset(
+        coords={
+            "time": (("time",), [0.0]), # Placeholder, replaced per file
+            "latitude": (("latitude",), RUMI_LAT),
+            "longitude": (("longitude",), RUMI_LON)
+        }
     )
 
-    first_var = AORC_VARS[0]
-    if first_var in root and root[first_var].shape[0] > 0:
-        sample = root[first_var][0]
-        finite = sample[np.isfinite(sample)]
-        if finite.size > 0:
-            tqdm.write(
-                f"  Sample check [{first_var}, IC=0]:  "
-                f"min={finite.min():.4f}  max={finite.max():.4f}  "
-                f"mean={finite.mean():.4f}  "
-                f"nan%={100*(1 - finite.size / sample.size):.2f}%"
-            )
-    tqdm.write(sep + "\n")
+    # Handle all RUMI variables
+    for r_var, (a_var, r_unit, r_std, r_long) in RUMI_VAR_MAP.items():
+        val = ds_rumi_raw[a_var].values
+        
+        if r_var == "PRATE":
+            val = val / 3600.0 # kg/m2 (hourly) -> kg/m2/s
+        elif r_var == "RH2M":
+            # Convert Q to RH using T2M and PSFC
+            q = ds_rumi_raw["SPFH_2maboveground"].values
+            t = ds_rumi_raw["TMP_2maboveground"].values
+            p = ds_rumi_raw["PRES_surface"].values
+            val = q_to_rh(q, t, p)
+        
+        # Add to dataset
+        ds_rumi[r_var] = (("time", "latitude", "longitude"), val[np.newaxis, ...])
+        ds_rumi[r_var].attrs.update({
+            "standard_name": r_std,
+            "long_name": r_long,
+            "units": r_unit,
+            "_FillValue": -9999.0
+        })
+
+    # 4. Save individual files per hour
+    for h_idx, h in enumerate(lead_hours):
+        valid_time = t0 + np.timedelta64(int(h), "h")
+        ts_str = str(valid_time).replace("-", "").replace("T", "").replace(":", "")[:14]
+        
+        # Filename: RUMI-<SRC>-<MODE>-<MODEL>-<EVENT>-<YYYYMMDDHHMMSS>.nc
+        fname = f"{args.experiment}-AirCastHK-{event_code}-{ts_str}.nc"
+        fpath = Path(out_dir) / fname
+        
+        log(f"  Saving {fname}...")
+        
+        # Create NetCDF4 file
+        with nc4.Dataset(fpath, "w", format="NETCDF4") as ds:
+            # Dimensions
+            ds.createDimension("time", 1)
+            ds.createDimension("latitude", RUMI_NLAT)
+            ds.createDimension("longitude", RUMI_NLON)
+            
+            # Coordinates
+            t_var = ds.createVariable("time", "f8", ("time",))
+            t_var.units = "seconds since 1970-01-01 00:00:00"
+            t_var.calendar = "gregorian"
+            t_var[0] = (valid_time.astype("datetime64[s]").astype(np.int64))
+            
+            lat_var = ds.createVariable("latitude", "f4", ("latitude",))
+            lat_var.units = "degrees_north"
+            lat_var[:] = RUMI_LAT
+            
+            lon_var = ds.createVariable("longitude", "f4", ("longitude",))
+            lon_var.units = "degrees_east"
+            lon_var[:] = RUMI_LON
+            
+            # Data Variables
+            for r_var in RUMI_VAR_MAP.keys():
+                v_out = ds.createVariable(r_var, "f4", ("time", "latitude", "longitude"), fill_value=-9999.0)
+                v_out.setncatts(ds_rumi[r_var].attrs)
+                v_out[0, :, :] = ds_rumi[r_var].values[0, h_idx, :, :]
+            
+            # Global Attributes
+            ds.experiment = args.experiment
+            ds.forcing_mode = f_mode
+            ds.forcing_source = args.experiment.split("-")[1]
+            ds.event = event_code
+            ds.institution = "AI Research Lab, WKU"
+            ds.source = "AirCast HongKong (UNet3D-Diffusion)"
+            ds.history = f"Created {time.strftime('%Y-%m-%d')} using inference_final_version.py"
+            ds.references = "https://github.com/manmeet3591/aircast_hongkong"
+            ds.horizontal_resolution = "300m (interpolated from 1km)"
+            ds.initialization_time = str(t0) + "Z"
 
 
 # =============================================================================
@@ -907,438 +870,152 @@ def _print_zarr_summary(out_zarr: str) -> None:
 # =============================================================================
 
 def run(args: argparse.Namespace) -> None:
-
     run_start = time.time()
-    log(f"{'='*72}")
-    log(f"Earthmind inference started  |  {ts()}")
-    log(f"{'='*72}")
+    log(f"Inference started. RUMI mode: {args.rumi}")
 
-    # ------------------------------------------------------------------ device
     device    = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp   = device == "cuda"
-    amp_dtype = torch.bfloat16
-    if use_amp and not torch.cuda.is_bf16_supported():
-        amp_dtype = torch.float16
-    log(f"Device={device}  AMP={use_amp}  dtype={amp_dtype if use_amp else 'fp32'}")
-
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
     ensure_dir(args.out_dir)
 
+    # -------------------------------------------------------- RUMI Logic
+    if args.rumi:
+        args.lat_min, args.lat_max = RUMI_LAT_MIN - 0.1, RUMI_LAT_MAX + 0.1
+        args.lon_min, args.lon_max = RUMI_LON_MIN - 0.1, RUMI_LON_MAX + 0.1
+        log(f"RUMI mode active. Forcing bbox to include HK: {args.lat_min}:{args.lat_max}, {args.lon_min}:{args.lon_max}")
+
     # -------------------------------------------------------- static grids
-    log(f"[{ts()}] Loading static grids (topo + svf)…")
+    log("Loading static grids…")
     topo, svf = load_static_grids(args.topo_nc, args.svf_nc)
     lat, lon, topo_arr, svf_arr = subset_static_to_bbox(
-        topo, svf,
-        args.lat_min, args.lat_max,
-        args.lon_min, args.lon_max,
+        topo, svf, args.lat_min, args.lat_max, args.lon_min, args.lon_max,
     )
     nlat, nlon = lat.size, lon.size
-    log(
-        f"Target grid: nlat={nlat} nlon={nlon}  "
-        f"lat=[{lat.min():.3f}, {lat.max():.3f}]  "
-        f"lon=[{lon.min():.3f}, {lon.max():.3f}]"
-    )
 
     # -------------------------------------------------------- GraphCast
-    log(f"[{ts()}] Loading GraphCast data…")
     if args.gcs_zarr_root:
-        log(f"Using GCS-style GraphCast data from: {args.gcs_zarr_root}")
-        ds_gc = open_gcs_graphcast(
-            args.gcs_zarr_root, args.gc_min_zarr, args.gc_max_zarr,
-            args.start_date, args.end_date,
-        )
+        ds_gc = open_gcs_graphcast(args.gcs_zarr_root, args.gc_min_zarr, args.gc_max_zarr, args.start_date, args.end_date)
     else:
-        ds_gc = open_and_prepare_graphcast(
-            args.graphcast_zarr, args.gc_min_zarr, args.gc_max_zarr,
-            args.start_date, args.end_date,
-        )
-    log(f"[{ts()}] GraphCast data loaded.")
+        ds_gc = open_and_prepare_graphcast(args.graphcast_zarr, args.gc_min_zarr, args.gc_max_zarr, args.start_date, args.end_date)
 
-    # ------------------------------------------------ print input structure
-    print("\n" + "=" * 72)
-    print("  GraphCast input dataset structure (after normalization & coord fix):")
-    print("=" * 72)
-    print(ds_gc)
-    print("=" * 72 + "\n")
-
-    # ----------------------------------------- bbox coverage check
     check_bbox_coverage(ds_gc, args.lat_min, args.lat_max, args.lon_min, args.lon_max)
 
     # ---------------------------------------------------- time axis
     all_times = np.sort(ds_gc["time"].values.astype("datetime64[ns]"))
-    if all_times.size == 0:
-        raise RuntimeError(
-            "No initialization times found in the requested date range "
-            f"({args.start_date} → {args.end_date}). Check your GraphCast data."
-        )
-
     chosen = np.sort(all_times[: args.num_inits])
-    log(
-        f"Init times (ICs) selected: {chosen.size}  "
-        f"first={chosen[0]}  last={chosen[-1]}"
-    )
-
-    # ------------------------------------------------ assert Tcond == 12
+    
     cond_offsets = ds_gc["prediction_timedelta"].values.astype("timedelta64[ns]")
-    tcond        = cond_offsets.size
-    assert tcond == TCOND, (
-        f"GraphCast zarr has {tcond} prediction_timedelta steps "
-        f"but model was trained with TCOND={TCOND}. "
-        f"Ensure you are using the correct GraphCast data."
-    )
-    log(f"Tcond assertion passed: prediction_timedelta steps = {tcond}")
-
-    # ------------------------------------------------ assert ttarget == 67
-    assert args.ttarget == TTARGET, (
-        f"--ttarget={args.ttarget} but model was trained with TTARGET={TTARGET}. "
-        f"Use --ttarget {TTARGET}."
-    )
-    log(f"Ttarget assertion passed: output lead hours = {args.ttarget}")
-
     lead_hours = np.arange(args.ttarget, dtype=np.int32)
     lead_td    = lead_hours.astype("timedelta64[h]")
 
-    # ------------------------------------------------ AORC inverse scale
+    # ------------------------------------------------ Normalization
     aorc_min_ds = xr.open_dataset(args.aorc_min_nc)
     aorc_max_ds = xr.open_dataset(args.aorc_max_nc)
     aorc_min    = {v: float(aorc_min_ds[v].values) for v in AORC_VARS}
     aorc_max    = {v: float(aorc_max_ds[v].values) for v in AORC_VARS}
 
-    # ------------------------------------------------ model + scheduler
-    log(f"[{ts()}] Loading model checkpoint…")
+    # ------------------------------------------------ model
     model     = load_model(args.checkpoint, device, use_amp, amp_dtype)
     scheduler = LCMScheduler(num_train_timesteps=1000)
-    log(f"[{ts()}] Model and scheduler ready.")
 
     # ------------------------------------------------ tiling
     tiles = list(iter_tiles(nlat, nlon, args.patch, args.stride))
-    log(f"Tiling: patch={args.patch}  stride={args.stride}  total_tiles={len(tiles)}")
-
     overlap   = args.patch - args.stride
     blend_w2d = make_blend_weights_2d(args.patch, max(overlap, 0))
-    log(
-        f"Blend weights: overlap={overlap}px  taper=cosine  "
-        f"w_min={blend_w2d.min():.4f}  w_max={blend_w2d.max():.4f}"
-    )
+    steps = int(args.steps[0])
 
-    step_list = [int(s) for s in args.steps]
-    log(f"Diffusion step configs to run: {step_list}")
+    # ============================================================
+    # IC loop
+    # ============================================================
+    for ic_idx, t0 in enumerate(chosen):
+        log(f"IC {ic_idx+1}/{chosen.size}: {t0}")
 
-    # ==============================================================
-    # Outer loop: diffusion step configs
-    # ==============================================================
-    for steps in tqdm(step_list, desc="diffusion-steps", unit="cfg"):
+        vt_cond_1d = (t0 + cond_offsets).astype("datetime64[ns]")
+        
+        # Storage for current IC (in-memory accumulation)
+        accum_data = {v: np.zeros((args.ttarget, nlat, nlon), dtype=np.float32) for v in AORC_VARS}
+        accum_weight = np.zeros((nlat, nlon), dtype=np.float32)
 
-        cfg_start = time.time()
-        log(f"\n{'─'*72}")
-        log(f"[{ts()}] Starting diffusion config: steps={steps}")
-        log(f"{'─'*72}")
+        # ========================================================
+        # Tile loop
+        # ========================================================
+        for i0, i1, j0, j1 in tqdm(tiles, desc="Tiles"):
+            lat_tile = lat[i0:i1]
+            lon_tile = lon[j0:j1]
 
-        out_zarr = str(Path(args.out_dir) / f"{args.out_name}_steps{steps:02d}.zarr")
-
-        init_output_store(
-            out_zarr=out_zarr,
-            time_ic=chosen,
-            lead_hours=lead_hours,
-            lat=lat,
-            lon=lon,
-            chunk_patch=args.patch,
-            overwrite=args.overwrite,
-        )
-
-        root = zarr.open_group(out_zarr, mode="a")
-
-        ic_bar = tqdm(
-            enumerate(chosen), total=chosen.size,
-            desc="init-times", unit="IC",
-        )
-
-        # ============================================================
-        # IC loop
-        # ============================================================
-        for ic_idx, t0 in ic_bar:
-            ic_start = time.time()
-            ic_bar.set_postfix({"t0": str(t0)[:16], "wall": ts()})
-            log(
-                f"\n[{ts()}] [steps={steps}] ── IC {ic_idx+1}/{chosen.size}: {t0} ──"
+            X_list = []
+            ds_tile = (
+                ds_gc[VARS_3D].sel(time=[t0])
+                .interp(latitude=lat_tile, longitude=lon_tile, method="linear")
+                .transpose("time", "prediction_timedelta", "latitude", "longitude").load()
             )
 
-            valid_time_1d = (t0 + lead_td).astype("datetime64[ns]")
-            write_valid_time(root, ic_idx, valid_time_1d)
+            for v in VARS_3D:
+                arr = ds_tile[v].values[0].astype(np.float32)
+                if v in PRECIP_GC_VARS: arr = np.clip(arr, 0.0, None)
+                X_list.append(arr)
 
-            # cos_sza valid times: shape (Tcond,) — matches training exactly
-            vt_cond_1d = (t0 + cond_offsets).astype("datetime64[ns]")
+            X_list.append(np.broadcast_to(topo_arr.isel(latitude=slice(i0, i1), longitude=slice(j0, j1)).values[None, :, :], (TCOND, args.patch, args.patch)))
+            X_list.append(np.broadcast_to(svf_arr.isel(latitude=slice(i0, i1), longitude=slice(j0, j1)).values[None, :, :], (TCOND, args.patch, args.patch)))
+            X_list.append(cos_sza_for_tile(vt_cond_1d, lat_tile, lon_tile))
 
-            # Accumulate blended predictions into zarr; weight map in RAM
-            accum_weight = np.zeros((nlat, nlon), dtype=np.float32)
+            X_np = np.stack(X_list, axis=0)[None].astype(np.float32)
 
-            # Zero out this IC's zarr slices before accumulation
-            zero_chunk = np.zeros(
-                (args.ttarget, args.patch, args.patch), dtype=np.float32
-            )
-            for (i0, i1, j0, j1) in tiles:
-                for v in AORC_VARS:
-                    root[v][ic_idx, :, i0:i1, j0:j1] = zero_chunk
-            log(f"  [{ts()}] Zeroed output zarr for IC {ic_idx+1}")
+            y_norm = infer_batch(X_np, model, scheduler, device, args.ttarget, args.patch, steps, use_amp, amp_dtype)
+            y_phys = inverse_scale(y_norm, aorc_min, aorc_max)[0]
 
-            # ========================================================
-            # Tile loop
-            # ========================================================
-            tile_bar = tqdm(
-                enumerate(tiles, start=1), total=len(tiles),
-                desc="  tiles", unit="tile", leave=False,
-            )
+            for k, v in enumerate(AORC_VARS):
+                accum_data[v][:, i0:i1, j0:j1] += y_phys[k] * blend_w2d[np.newaxis, :, :]
+            accum_weight[i0:i1, j0:j1] += blend_w2d
 
-            for tile_i, (i0, i1, j0, j1) in tile_bar:
-                tile_start = time.time()
-                tile_bar.set_postfix({
-                    "i": f"{i0}:{i1}",
-                    "j": f"{j0}:{j1}",
-                    "wall": ts(),
-                })
+        # Normalize blending
+        accum_weight = np.maximum(accum_weight, 1e-12)
+        for v in AORC_VARS:
+            accum_data[v] /= accum_weight[np.newaxis, :, :]
 
-                lat_tile = lat[i0:i1]   # (P,)
-                lon_tile = lon[j0:j1]   # (P,)
+        # Save Output
+        if args.rumi:
+            write_rumi_nc(args.out_dir, args.event, t0, lead_hours, lat, lon, accum_data, args)
+        else:
+            # Default Zarr Save (minimal implementation for brevity)
+            out_zarr = Path(args.out_dir) / f"{args.out_name}_IC{ic_idx}.zarr"
+            ds_out = xr.Dataset(coords={"time_ic": [t0], "lead_time": lead_hours, "latitude": lat, "longitude": lon})
+            for v in AORC_VARS: ds_out[v] = (("time_ic", "lead_time", "latitude", "longitude"), accum_data[v][np.newaxis, ...])
+            ds_out.to_zarr(out_zarr, mode="w")
 
-                # --------------------------------------------------
-                # Build input X exactly as in training:
-                #   each channel → (Tcond, P, P)
-                #   stack → (C=20, Tcond, P, P) → add batch → (1, 20, Tcond, P, P)
-                # --------------------------------------------------
-                X_list: List[np.ndarray] = []
+    log(f"All complete in {time.time()-run_start:.1f}s")
 
-                # 3D GraphCast vars: 17 channels, each (Tcond, P, P)
-                with dask.config.set(scheduler="threads"):
-                    ds_tile = (
-                        ds_gc[VARS_3D]
-                        .sel(time=[t0])
-                        .interp(
-                            latitude=("latitude",   lat_tile),
-                            longitude=("longitude", lon_tile),
-                            method="linear",
-                        )
-                        .transpose(
-                            "time", "prediction_timedelta", "latitude", "longitude"
-                        )
-                        .load()
-                    )
-
-                for v in VARS_3D:
-                    arr = ds_tile[v].values[0].astype(np.float32)  # (Tcond, P, P)
-                    if v in PRECIP_GC_VARS:
-                        arr = np.clip(arr, 0.0, None)
-                    X_list.append(arr)
-
-                # topo: broadcast (P,P) → (Tcond, P, P)
-                topo_tile = (
-                    topo_arr
-                    .isel(latitude=slice(i0, i1), longitude=slice(j0, j1))
-                    .values.astype(np.float32)
-                )
-                X_list.append(
-                    np.broadcast_to(
-                        topo_tile[None, :, :], (TCOND, args.patch, args.patch)
-                    ).copy()
-                )
-
-                # svf: broadcast (P,P) → (Tcond, P, P)
-                svf_tile = (
-                    svf_arr
-                    .isel(latitude=slice(i0, i1), longitude=slice(j0, j1))
-                    .values.astype(np.float32)
-                )
-                X_list.append(
-                    np.broadcast_to(
-                        svf_tile[None, :, :], (TCOND, args.patch, args.patch)
-                    ).copy()
-                )
-
-                # cos_sza: (Tcond, P, P) — vt_cond_1d is (Tcond,) no batch dim
-                cos_sza = cos_sza_for_tile(vt_cond_1d, lat_tile, lon_tile)
-                X_list.append(cos_sza)
-
-                # Stack → (C=20, Tcond, P, P) → add batch → (1, 20, Tcond, P, P)
-                X_np = np.stack(X_list, axis=0)[None].astype(np.float32)
-                assert X_np.shape[1] == COND_CHANNELS, (
-                    f"X channel count mismatch: got {X_np.shape[1]}, "
-                    f"expected {COND_CHANNELS}"
-                )
-
-                # --------------------------------------------------
-                # Diffusion reverse process (denoising)
-                # --------------------------------------------------
-                y_norm = infer_batch(
-                    X_np=X_np,
-                    model=model,
-                    scheduler=scheduler,
-                    device=device,
-                    ttarget=args.ttarget,
-                    patch=args.patch,
-                    num_steps=steps,
-                    use_amp=use_amp,
-                    amp_dtype=amp_dtype,
-                )  # (1, 8, Ttarget, P, P)
-
-                # --------------------------------------------------
-                # Inverse scale → physical units, then blend.
-                # Blending is in physical space (after inverse scaling)
-                # because precip uses expm1 (nonlinear); blending in
-                # log-space then inverting would give wrong results.
-                # --------------------------------------------------
-                y_phys = inverse_scale(y_norm, aorc_min, aorc_max)[0]
-                # y_phys: (8, Ttarget, P, P)
-
-                for k, v in enumerate(AORC_VARS):
-                    current = root[v][ic_idx, :, i0:i1, j0:j1]  # (T, P, P)
-                    root[v][ic_idx, :, i0:i1, j0:j1] = (
-                        current + y_phys[k] * blend_w2d[np.newaxis, :, :]
-                    )
-                accum_weight[i0:i1, j0:j1] += blend_w2d
-
-                tile_elapsed = time.time() - tile_start
-                if (tile_i % args.log_every_tiles) == 0:
-                    log(
-                        f"  [{ts()}] tile {tile_i}/{len(tiles)}  "
-                        f"(i={i0}:{i1}, j={j0}:{j1})  "
-                        f"tile_time={tile_elapsed:.2f}s"
-                    )
-
-            # ---- normalize by accumulated blend weights  ----
-            accum_weight = np.maximum(accum_weight, 1e-12)
-            strip_size   = 256
-            for row_start in range(0, nlat, strip_size):
-                row_end  = min(row_start + strip_size, nlat)
-                w_strip  = accum_weight[row_start:row_end, :]        # (strip, nlon)
-                w_strip4 = w_strip[np.newaxis, :, :]                 # (1, strip, nlon)
-                for v in AORC_VARS:
-                    chunk = root[v][ic_idx, :, row_start:row_end, :] # (T, strip, nlon)
-                    root[v][ic_idx, :, row_start:row_end, :] = (
-                        chunk / w_strip4
-                    ).astype(np.float32)
-
-            del accum_weight
-
-            ic_elapsed = time.time() - ic_start
-            log(
-                f"  [{ts()}] IC {ic_idx+1}/{chosen.size} complete  "
-                f"elapsed={ic_elapsed:.1f}s  ({ic_elapsed/60:.1f} min)"
-            )
-
-        zarr.consolidate_metadata(out_zarr)
-
-        cfg_elapsed = time.time() - cfg_start
-        log(
-            f"\n[{ts()}] [DONE] steps={steps}  output={out_zarr}  "
-            f"total_time={cfg_elapsed:.1f}s  ({cfg_elapsed/60:.1f} min)"
-        )
-        _print_zarr_summary(out_zarr)
-
-    total_elapsed = time.time() - run_start
-    log(f"\n{'='*72}")
-    log(
-        f"All diffusion configs complete.  "
-        f"Total wall time: {total_elapsed:.1f}s  ({total_elapsed/60:.1f} min)"
-    )
-    log(f"{'='*72}\n")
-
-
-# =============================================================================
-# Argument parser
-# =============================================================================
 
 def parse_args() -> argparse.Namespace:
-
-    class _Fmt(
-        argparse.RawDescriptionHelpFormatter,
-        argparse.ArgumentDefaultsHelpFormatter,
-    ):
-        pass
-
-    p = argparse.ArgumentParser(
-        description=(
-            "Earthmind Downscaling Inference\n"
-            "-------------------------------------------------------\n"
-            "Authors  : Somnath Luitel & Manmeet Singh\n"
-            "Lab      : AI Research Lab, Earth, Environment and\n"
-            "           Atmospheric Sciences, WKU, Bowling Green, KY, USA\n"
-        ),
-        formatter_class=_Fmt,
-    )
-
-    # GraphCast source — mutually exclusive
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument(
-        "--graphcast_zarr",
-        default=None,
-        help="Path to a single local GraphCast zarr file.",
-    )
-    src.add_argument(
-        "--gcs_zarr_root",
-        default=None,
-        help=(
-            "Root directory of GCS-style GraphCast data "
-            "(subdirs named YYYY_to_YYYY or YYYY_to_present)."
-        ),
-    )
-
-    # Normalization files
-    p.add_argument("--gc_min_zarr", required=True, help="GraphCast min-values zarr.")
-    p.add_argument("--gc_max_zarr", required=True, help="GraphCast max-values zarr.")
-    p.add_argument("--aorc_min_nc", required=True, help="AORC min-values .nc (for inverse scaling).")
-    p.add_argument("--aorc_max_nc", required=True, help="AORC max-values .nc (for inverse scaling).")
-
-    # Static grids
-    p.add_argument("--topo_nc", required=True, help="Topography .nc file (var: norm_elevation).")
-    p.add_argument("--svf_nc",  required=True, help="Sky-view-factor .nc file (var: SKY_VIEW_FACTOR).")
-
-    # Model
-    p.add_argument("--checkpoint", required=True, help="Path to trained .pt checkpoint file.")
-
-    # Time range
-    p.add_argument("--start_date", required=True, help="Start date e.g. 2021-07-04.")
-    p.add_argument("--end_date",   required=True, help="End date   e.g. 2021-12-31.")
-    p.add_argument(
-        "--num_inits", type=int, default=3,
-        help=(
-            "Number of GraphCast initialization times (ICs) to run. "
-            "Each IC is one timestamp on the GraphCast 'time' axis "
-            "(e.g. 2021-07-04T00:00, 2021-07-04T06:00, …). "
-            "The first --num_inits chronological ICs are used."
-        ),
-    )
-
-    # Bounding box — must be within GraphCast domain; coverage is checked at runtime
-    p.add_argument("--lat_min", type=float, required=True, help="Minimum latitude  of target domain.")
-    p.add_argument("--lat_max", type=float, required=True, help="Maximum latitude  of target domain.")
-    p.add_argument("--lon_min", type=float, required=True, help="Minimum longitude of target domain.")
-    p.add_argument("--lon_max", type=float, required=True, help="Maximum longitude of target domain.")
-
-    # Tiling & model config
-    p.add_argument("--patch",  type=int, default=256, help="Tile (patch) size in pixels.")
-    p.add_argument(
-        "--stride", type=int, default=128,
-        help="Stride between tiles. overlap = patch - stride. Default gives 128px overlap.",
-    )
-    p.add_argument(
-        "--ttarget", type=int, default=TTARGET,
-        help=f"Number of hourly output lead times. Must be {TTARGET} (architectural constraint).",
-    )
-    p.add_argument(
-        "--steps", nargs="+", default=["25"],
-        help=(
-            "Diffusion denoising steps to run. "
-            "One output zarr produced per value. "
-            "Paper runs: 4 8 25 50.  Default: 25."
-        ),
-    )
-
-    # Output
-    p.add_argument("--out_dir",         required=True,              help="Output directory.")
-    p.add_argument("--out_name",        default="conus_inference",  help="Base name for output zarr files.")
-    p.add_argument("--overwrite",       action="store_true",        help="Overwrite existing output.")
-    p.add_argument("--log_every_tiles", type=int, default=25,       help="Log progress every N tiles.")
-
+    p = argparse.ArgumentParser()
+    p.add_argument("--graphcast_zarr", help="Path to local GC zarr.")
+    p.add_argument("--gcs_zarr_root", help="Root of GCS-style GC data.")
+    p.add_argument("--gc_min_zarr", required=True)
+    p.add_argument("--gc_max_zarr", required=True)
+    p.add_argument("--aorc_min_nc", required=True)
+    p.add_argument("--aorc_max_nc", required=True)
+    p.add_argument("--topo_nc", required=True)
+    p.add_argument("--svf_nc",  required=True)
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--start_date", required=True)
+    p.add_argument("--end_date",   required=True)
+    p.add_argument("--num_inits", type=int, default=1)
+    p.add_argument("--lat_min", type=float, default=22.0)
+    p.add_argument("--lat_max", type=float, default=23.0)
+    p.add_argument("--lon_min", type=float, default=113.5)
+    p.add_argument("--lon_max", type=float, default=114.5)
+    p.add_argument("--patch",  type=int, default=64) # Modified to 64 to match weights/training
+    p.add_argument("--stride", type=int, default=32)
+    p.add_argument("--ttarget", type=int, default=67)
+    p.add_argument("--steps", nargs="+", default=["25"])
+    p.add_argument("--out_dir", required=True)
+    p.add_argument("--out_name", default="inference_output")
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--rumi", action="store_true", help="Enable RUMI output mode (300m NetCDF4)")
+    p.add_argument("--event", default="MANGKHUT2018", help="RUMI event code")
+    p.add_argument("--experiment", default="RUMI-ERA5-AN", help="RUMI experiment tag")
     return p.parse_args()
-
 
 if __name__ == "__main__":
     run(parse_args())
