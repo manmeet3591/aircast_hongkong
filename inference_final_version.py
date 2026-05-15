@@ -359,25 +359,30 @@ def open_and_prepare_graphcast(
 
 def _find_zarr_stores_in_dir(year_dir: Path) -> List[Tuple[Path, str]]:
     results: List[Tuple[Path, str]] = []
+    
+    # 1. Check for single top-level Zarr (Format A or B)
+    # common names: predictions.zarr, graphcast_6_hours.zarr, etc.
+    for name in ["predictions.zarr", "graphcast_6_hours.zarr", "graphcast_12_hours.zarr"]:
+        pz = year_dir / name
+        if pz.is_dir():
+            fmt = "B" if "12_hours" in name else "A"
+            results.append((pz, fmt))
+    
+    if results:
+        return results
+
+    # 2. Check for per-IC directories (Format C)
+    # naming: 20250101_00hr_01_preds/
     per_ic_pattern = re.compile(r"^\d{8}_\d{2}hr_\d{2}_preds$")
-    per_ic_dirs = [
-        d for d in sorted(year_dir.iterdir())
-        if d.is_dir() and per_ic_pattern.match(d.name)
-    ]
-    if per_ic_dirs:
-        for ic_dir in per_ic_dirs:
-            pz = ic_dir / "predictions.zarr"
+    try:
+        subdirs = [d for d in os.listdir(year_dir) if per_ic_pattern.match(d)]
+        for sd in sorted(subdirs):
+            pz = year_dir / sd / "predictions.zarr"
             if pz.is_dir():
                 results.append((pz, "C"))
-        return results
-    for zarr_path in sorted(year_dir.glob("**/*.zarr")):
-        if not zarr_path.is_dir():
-            continue
-        name = zarr_path.name
-        if "_6_hours.zarr" in name or "predictions.zarr" in name:
-            results.append((zarr_path, "A"))
-        elif "_12_hours.zarr" in name:
-            results.append((zarr_path, "B"))
+    except Exception as e:
+        log(f"      [WARN] error scanning {year_dir}: {e}")
+
     return results
 
 
@@ -435,16 +440,24 @@ def open_gcs_graphcast(
     start_date: str,
     end_date: str,
 ) -> xr.Dataset:
+    log(f"  Searching GCS root: {gcs_root}...")
     gcs_root_p = Path(gcs_root)
     start_dt   = np.datetime64(start_date, "D")
     end_dt     = np.datetime64(end_date,   "D")
 
     datasets: List[xr.Dataset] = []
 
-    for year_dir in sorted(gcs_root_p.iterdir()):
-        if not year_dir.is_dir():
-            continue
-        m = re.search(r"(\d{4})_to_(\d{4}|present)", year_dir.name)
+    log(f"  Filtering year directories in {gcs_root}...")
+    try:
+        yd_names = sorted([d for d in os.listdir(gcs_root) if os.path.isdir(os.path.join(gcs_root, d))])
+    except Exception as e:
+        log(f"  [ERROR] listing {gcs_root}: {e}")
+        raise
+
+    for yd_name in yd_names:
+        log(f"    Checking {yd_name}...")
+        year_dir = gcs_root_p / yd_name
+        m = re.search(r"(\d{4})_to_(\d{4}|present)", yd_name)
         if not m:
             continue
         yr_start  = int(m.group(1))
@@ -453,12 +466,13 @@ def open_gcs_graphcast(
         dir_end   = np.datetime64(f"{yr_end}-12-31",   "D")
 
         if dir_end < start_dt or dir_start > end_dt:
+            log(f"      Skipping (out of range: {dir_start} to {dir_end})")
             continue
 
         for zarr_path, fmt in _find_zarr_stores_in_dir(year_dir):
+            log(f"        Found {zarr_path.name} (fmt={fmt})...")
             try:
                 if fmt == "C":
-                    ic_dir_name = zarr_path.parent.name
                     mm = re.match(r"(\d{4})(\d{2})(\d{2})_(\d{2})hr", ic_dir_name)
                     if not mm:
                         continue
@@ -517,23 +531,27 @@ def open_gcs_graphcast(
 def load_static_grids(
     topo_nc: str, svf_nc: str
 ) -> Tuple[xr.Dataset, xr.Dataset]:
-    topo0 = xr.open_dataset(topo_nc)
-    svf0  = xr.open_dataset(svf_nc)
+    log(f"  Opening {topo_nc}...")
+    topo0 = xr.open_dataset(topo_nc).load()
+    log(f"  Opening {svf_nc}...")
+    svf0  = xr.open_dataset(svf_nc).load()
 
     # Some files use lat/lon, others latitude/longitude
     t_lat, t_lon = _standardize_lat_lon_coords(topo0)
     s_lat, s_lon = _standardize_lat_lon_coords(svf0)
 
+    log(f"  Renaming coords (Topo: {t_lat}/{t_lon}, SVF: {s_lat}/{s_lon})...")
     topo = topo0.rename({t_lat: "latitude", t_lon: "longitude"})
     svf  = svf0.rename({s_lat: "latitude", s_lon: "longitude"})
 
-    topo = topo.assign_coords(
-        longitude=_maybe_convert_lon_360_to_180(topo["longitude"].values)
-    ).sortby("longitude")
-    svf = svf.assign_coords(
-        longitude=_maybe_convert_lon_360_to_180(svf["longitude"].values)
-    ).sortby("longitude")
-
+    log("  Checking longitude ranges (SKIPPED)...")
+    # if topo["longitude"].max() > 180:
+    #     log("    Converting Topo longitude 360 -> 180...")
+    #     topo = topo.assign_coords(longitude=(((topo.longitude + 180) % 360) - 180)).sortby("longitude")
+    # if svf["longitude"].max() > 180:
+    #     log("    Converting SVF longitude 360 -> 180...")
+    #     svf = svf.assign_coords(longitude=(((svf.longitude + 180) % 360) - 180)).sortby("longitude")
+    
     return topo, svf
 
 
@@ -542,6 +560,7 @@ def subset_static_to_bbox(
     lat_min: float, lat_max: float,
     lon_min: float, lon_max: float,
 ) -> Tuple[np.ndarray, np.ndarray, xr.DataArray, xr.DataArray]:
+    log(f"  Subsetting grids to bbox: {lat_min}:{lat_max}, {lon_min}:{lon_max}...")
     topo_sub = topo.sel(
         latitude=slice(lat_min, lat_max),
         longitude=slice(lon_min, lon_max),
@@ -551,12 +570,14 @@ def subset_static_to_bbox(
         longitude=slice(lon_min, lon_max),
     )
 
+    log("  Extracting coordinate arrays...")
     lat = topo_sub["latitude"].values.astype(np.float32)
     lon = topo_sub["longitude"].values.astype(np.float32)
 
     t_var = "norm_elevation" if "norm_elevation" in topo_sub else "ELEVATION"
     s_var = "SKY_VIEW_FACTOR"
 
+    log(f"  Extracting variables ({t_var}, {s_var})...")
     topo_arr = topo_sub[t_var].astype(np.float32)
     svf_arr  = svf_sub[s_var].astype(np.float32)
     return lat, lon, topo_arr, svf_arr
@@ -794,7 +815,7 @@ def write_rumi_nc(
 
     # Handle all RUMI variables
     for r_var, (a_var, r_unit, r_std, r_long) in RUMI_VAR_MAP.items():
-        val = ds_rumi_raw[a_var].values
+        val = ds_rumi_raw[a_var].values # shape: (T, H, W)
         
         if r_var == "PRATE":
             val = val / 3600.0 # kg/m2 (hourly) -> kg/m2/s
@@ -805,8 +826,8 @@ def write_rumi_nc(
             p = ds_rumi_raw["PRES_surface"].values
             val = q_to_rh(q, t, p)
         
-        # Add to dataset
-        ds_rumi[r_var] = (("time", "latitude", "longitude"), val[np.newaxis, ...])
+        # Create temporary DataArray to hold the interpolated/converted data
+        ds_rumi[r_var] = (("lead_hour", "latitude", "longitude"), val)
         ds_rumi[r_var].attrs.update({
             "standard_name": r_std,
             "long_name": r_long,
@@ -836,7 +857,7 @@ def write_rumi_nc(
             t_var = ds.createVariable("time", "f8", ("time",))
             t_var.units = "seconds since 1970-01-01 00:00:00"
             t_var.calendar = "gregorian"
-            t_var[0] = (valid_time.astype("datetime64[s]").astype(np.int64))
+            t_var[0] = int(valid_time.astype("datetime64[s]").astype(np.int64))
             
             lat_var = ds.createVariable("latitude", "f4", ("latitude",))
             lat_var.units = "degrees_north"
@@ -849,8 +870,12 @@ def write_rumi_nc(
             # Data Variables
             for r_var in RUMI_VAR_MAP.keys():
                 v_out = ds.createVariable(r_var, "f4", ("time", "latitude", "longitude"), fill_value=-9999.0)
-                v_out.setncatts(ds_rumi[r_var].attrs)
-                v_out[0, :, :] = ds_rumi[r_var].values[0, h_idx, :, :]
+                # Remove _FillValue from attrs to avoid mismatch/conflict with createVariable
+                attrs = dict(ds_rumi[r_var].attrs)
+                attrs.pop("_FillValue", None)
+                v_out.setncatts(attrs)
+                # Slice the DataArray at current lead hour and add the time dimension back
+                v_out[0, :, :] = ds_rumi[r_var].values[h_idx, :, :].astype(np.float32)
             
             # Global Attributes
             ds.experiment = args.experiment
